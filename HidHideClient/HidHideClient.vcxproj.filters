@@ -54,6 +54,9 @@
     <ClInclude Include="..\HidHideCLI\src\FilterDriverProxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\ProfilesDlg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="HidHideClient.rc">
@@ -92,6 +95,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\HidHideCLI\src\FilterDriverProxy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ProfilesDlg.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

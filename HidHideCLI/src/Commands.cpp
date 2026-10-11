@@ -12,6 +12,17 @@
 
 namespace
 {
+    // The maximum number of characters allowed in a profile name (mirrors the driver's limit)
+    constexpr size_t MaxProfileNameLength{ 128 };
+
+    // Is the value provided acceptable as a profile name?
+    // Reject the key-path separator as the profile is stored as a registry subkey
+    bool ValidProfileName(_In_ std::wstring const& value)
+    {
+        if (value.empty() || (value.size() > MaxProfileNameLength)) return (false);
+        return (std::wstring::npos == value.find(L'\\'));
+    }
+
     // https://stackoverflow.com/a/33799784
     std::wstring escape_json(const std::wstring &s) {
         std::wostringstream o;
@@ -112,7 +123,16 @@ namespace HidHide
             { L"dev-list",     { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_DEV_LIST),     std::bind(&CommandInterpreter::DevList,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
             { L"dev-unhide",   { StringTable(IDS_CLI_SYNTAX_DEV_INST_PATH), StringTable(IDS_CLI_DEV_UNHIDE),   std::bind(&CommandInterpreter::DevUnhinde,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneDeviceInstancePath, this, std::placeholders::_1) } },
             { L"help",         { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_HELP),         std::bind(&CommandInterpreter::Help,        this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
-            { L"version",      { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_VERSION),      std::bind(&CommandInterpreter::Version,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } }
+            { L"version",      { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_VERSION),      std::bind(&CommandInterpreter::Version,     this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
+            { L"profile-new",  { StringTable(IDS_CLI_SYNTAX_PROFILE_NAME),  StringTable(IDS_CLI_PROFILE_NEW),  std::bind(&CommandInterpreter::ProfileNew,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneProfileName, this, std::placeholders::_1) } },
+            { L"profile-del",  { StringTable(IDS_CLI_SYNTAX_PROFILE_NAME),  StringTable(IDS_CLI_PROFILE_DEL),  std::bind(&CommandInterpreter::ProfileDel,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneProfileName, this, std::placeholders::_1) } },
+            { L"profile-list", { StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS),  StringTable(IDS_CLI_PROFILE_LIST), std::bind(&CommandInterpreter::ProfileList, this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } },
+            { L"profile-show", { StringTable(IDS_CLI_SYNTAX_PROFILE_NAME),  StringTable(IDS_CLI_PROFILE_SHOW), std::bind(&CommandInterpreter::ProfileShow, this, std::placeholders::_1), std::bind(&CommandInterpreter::ValOneProfileName, this, std::placeholders::_1) } },
+            { L"profile-app-reg",   { StringTable(IDS_CLI_SYNTAX_PROFILE_APP_PATH),      StringTable(IDS_CLI_PROFILE_APP_REG),    std::bind(&CommandInterpreter::ProfileAppReg,   this, std::placeholders::_1), std::bind(&CommandInterpreter::ValProfileNameAndFullyQualifiedExecutablePath, this, std::placeholders::_1) } },
+            { L"profile-app-unreg", { StringTable(IDS_CLI_SYNTAX_PROFILE_APP_PATH),      StringTable(IDS_CLI_PROFILE_APP_UNREG),  std::bind(&CommandInterpreter::ProfileAppUnreg, this, std::placeholders::_1), std::bind(&CommandInterpreter::ValProfileNameAndFullyQualifiedExecutablePath, this, std::placeholders::_1) } },
+            { L"profile-dev-hide",  { StringTable(IDS_CLI_SYNTAX_PROFILE_DEV_INST_PATH), StringTable(IDS_CLI_PROFILE_DEV_HIDE),   std::bind(&CommandInterpreter::ProfileDevHide,  this, std::placeholders::_1), std::bind(&CommandInterpreter::ValProfileNameAndDeviceInstancePath, this, std::placeholders::_1) } },
+            { L"profile-dev-unhide",{ StringTable(IDS_CLI_SYNTAX_PROFILE_DEV_INST_PATH), StringTable(IDS_CLI_PROFILE_DEV_UNHIDE), std::bind(&CommandInterpreter::ProfileDevUnhide,this, std::placeholders::_1), std::bind(&CommandInterpreter::ValProfileNameAndDeviceInstancePath, this, std::placeholders::_1) } },
+            { L"profile-active",{ StringTable(IDS_CLI_SYNTAX_NO_ARGUMENTS), StringTable(IDS_CLI_PROFILE_ACTIVE),std::bind(&CommandInterpreter::ProfileActive, this, std::placeholders::_1), std::bind(&CommandInterpreter::ValNoArguments, this, std::placeholders::_1) } }
           }
         , m_FilterDriverProxy(writeThrough)
         , m_Cancel{}
@@ -146,6 +166,38 @@ namespace HidHide
         if (!HidHide::FileIsAnApplication(fullyQualifiedFileName)) return (HidHide::StringTable(IDS_NOT_AN_EXECUTABLE));
         auto const fullImageName{ HidHide::FileNameToFullImageName(fullyQualifiedFileName) };
         if (fullImageName.empty()) return (HidHide::StringTable(IDS_NOT_ON_A_VOLUME));
+        return (std::wstring{});
+    }
+
+    _Use_decl_annotations_
+    std::wstring CommandInterpreter::ValOneProfileName(Args const& args) const
+    {
+        TRACE_ALWAYS(L"");
+        if (2 != args.size()) return (HidHide::StringTable(IDS_WRONG_NUMBER_OF_ARGUMENTS));
+        if (!ValidProfileName(args.at(1))) return (HidHide::StringTable(IDS_PROFILE_NAME_INVALID));
+        return (std::wstring{});
+    }
+
+    _Use_decl_annotations_
+    std::wstring CommandInterpreter::ValProfileNameAndFullyQualifiedExecutablePath(Args const& args) const
+    {
+        TRACE_ALWAYS(L"");
+        if (3 != args.size()) return (HidHide::StringTable(IDS_WRONG_NUMBER_OF_ARGUMENTS));
+        if (!ValidProfileName(args.at(1))) return (HidHide::StringTable(IDS_PROFILE_NAME_INVALID));
+        auto const fullyQualifiedFileName{ std::filesystem::path(args.at(2)) };
+        if (fullyQualifiedFileName.is_relative()) return (HidHide::StringTable(IDS_NOT_A_FULLY_QUALIFIED_PATH));
+        if (!HidHide::FileIsAnApplication(fullyQualifiedFileName)) return (HidHide::StringTable(IDS_NOT_AN_EXECUTABLE));
+        if (HidHide::FileNameToFullImageName(fullyQualifiedFileName).empty()) return (HidHide::StringTable(IDS_NOT_ON_A_VOLUME));
+        return (std::wstring{});
+    }
+
+    _Use_decl_annotations_
+    std::wstring CommandInterpreter::ValProfileNameAndDeviceInstancePath(Args const& args) const
+    {
+        TRACE_ALWAYS(L"");
+        if (3 != args.size()) return (HidHide::StringTable(IDS_WRONG_NUMBER_OF_ARGUMENTS));
+        if (!ValidProfileName(args.at(1))) return (HidHide::StringTable(IDS_PROFILE_NAME_INVALID));
+        if (args.at(2).size() > MAX_DEVICE_ID_LEN) return (HidHide::StringTable(IDS_DEV_INST_PATH_TOO_LONG));
         return (std::wstring{});
     }
 
@@ -310,5 +362,89 @@ namespace HidHide
     {
         TRACE_ALWAYS(L"");
         std::wcout << (m_FilterDriverProxy.GetInverse() ? L"--inv-on" : L"--inv-off") << std::endl;
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileNew(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.SetProfile(args.at(1), ApplicationProfile{});
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileDel(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.DeleteProfile(args.at(1));
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileList(Args const&) const
+    {
+        TRACE_ALWAYS(L"");
+        for (auto const& profile : m_FilterDriverProxy.GetProfiles())
+        {
+            std::wcout << L"--profile-show \"" << profile.first << L"\"" << std::endl;
+        }
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileShow(Args const& args) const
+    {
+        TRACE_ALWAYS(L"");
+
+        ApplicationProfile profile;
+        if (!m_FilterDriverProxy.GetProfile(args.at(1), profile))
+        {
+            std::wcout << HidHide::StringTable(IDS_PROFILE_NOT_FOUND) << std::endl;
+            return;
+        }
+
+        // Reproduce the profile as a sequence of commands
+        std::wcout << L"--profile-new \"" << args.at(1) << L"\"" << std::endl;
+        for (auto const& application : profile.Applications)
+        {
+            std::wcout << L"--profile-app-reg \"" << args.at(1) << L"\" \"" << application.wstring() << L"\"" << std::endl;
+        }
+        for (auto const& deviceInstancePath : profile.DeviceInstancePaths)
+        {
+            std::wcout << L"--profile-dev-hide \"" << args.at(1) << L"\" \"" << deviceInstancePath << L"\"" << std::endl;
+        }
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileAppReg(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.ProfileApplicationsAddEntry(args.at(1), HidHide::FileNameToFullImageName(args.at(2)));
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileAppUnreg(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.ProfileApplicationsDelEntry(args.at(1), HidHide::FileNameToFullImageName(args.at(2)));
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileDevHide(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.ProfileDeviceInstancePathsAddEntry(args.at(1), args.at(2));
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileDevUnhide(Args const& args)
+    {
+        TRACE_ALWAYS(L"");
+        m_FilterDriverProxy.ProfileDeviceInstancePathsDelEntry(args.at(1), args.at(2));
+    }
+
+    _Use_decl_annotations_
+    void CommandInterpreter::ProfileActive(Args const&) const
+    {
+        TRACE_ALWAYS(L"");
+        auto const name{ m_FilterDriverProxy.ActiveProfile() };
+        if (!name.empty()) std::wcout << name << std::endl;
     }
 }

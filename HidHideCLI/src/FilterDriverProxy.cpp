@@ -109,6 +109,96 @@ namespace
         buffer.at(0) = (inverse ? TRUE : FALSE);
         if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_SET_WLINVERSE), buffer.data(), static_cast<DWORD>(buffer.size() * sizeof(BOOLEAN)), nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
     }
+
+    // The wire-format prefixes used to tag the entries of an application profile
+    std::wstring const ProfileApplicationPrefix{ L"A:" };
+    std::wstring const ProfileDevicePrefix{ L"D:" };
+
+    // Get the names of the application profiles
+    std::vector<std::wstring> GetProfileNames(_In_ HANDLE device)
+    {
+        TRACE_ALWAYS(L"");
+        DWORD needed{};
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_PROFILES), nullptr, 0, nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        auto buffer{ std::vector<WCHAR>(needed / sizeof(WCHAR)) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_PROFILES), nullptr, 0, buffer.data(), static_cast<DWORD>(buffer.size() * sizeof(WCHAR)), &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        return (HidHide::MultiStringToStringList(buffer));
+    }
+
+    // Get the raw multi-string entries of a single application profile (the first entry is the profile name)
+    std::vector<std::wstring> GetProfileEntries(_In_ HANDLE device, _In_ std::wstring const& name)
+    {
+        TRACE_ALWAYS(L"");
+        DWORD needed{};
+        auto request{ HidHide::StringListToMultiString({ name }) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_PROFILE), request.data(), static_cast<DWORD>(request.size() * sizeof(WCHAR)), nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        auto buffer{ std::vector<WCHAR>(needed / sizeof(WCHAR)) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_PROFILE), request.data(), static_cast<DWORD>(request.size() * sizeof(WCHAR)), buffer.data(), static_cast<DWORD>(buffer.size() * sizeof(WCHAR)), &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        return (HidHide::MultiStringToStringList(buffer));
+    }
+
+    // Convert the raw multi-string entries of a profile into an ApplicationProfile
+    HidHide::ApplicationProfile ProfileFromEntries(_In_ std::vector<std::wstring> const& entries)
+    {
+        TRACE_ALWAYS(L"");
+        HidHide::ApplicationProfile profile;
+        for (size_t index{ 1 }; index < entries.size(); index++)
+        {
+            auto const& entry{ entries.at(index) };
+            if (entry.size() < 2) continue;
+            auto const prefix{ entry.substr(0, 2) };
+            auto const value{ entry.substr(2) };
+            if (_wcsnicmp(prefix.c_str(), ProfileApplicationPrefix.c_str(), 2) == 0) profile.Applications.emplace(value);
+            else if (_wcsnicmp(prefix.c_str(), ProfileDevicePrefix.c_str(), 2) == 0) profile.DeviceInstancePaths.emplace(value);
+        }
+        return (profile);
+    }
+
+    // Get all application profiles (keyed by profile name)
+    HidHide::ApplicationProfiles GetProfiles(_In_ HANDLE device)
+    {
+        TRACE_ALWAYS(L"");
+        HidHide::ApplicationProfiles profiles;
+        for (auto const& name : GetProfileNames(device))
+        {
+            profiles.emplace(name, ProfileFromEntries(GetProfileEntries(device, name)));
+        }
+        return (profiles);
+    }
+
+    // Create or replace an application profile
+    void SetProfile(_In_ HANDLE device, _In_ std::wstring const& name, _In_ HidHide::ApplicationProfile const& profile)
+    {
+        TRACE_ALWAYS(L"");
+        std::vector<std::wstring> entries;
+        entries.emplace_back(name);
+        for (auto const& application : profile.Applications) entries.emplace_back(ProfileApplicationPrefix + application.wstring());
+        for (auto const& deviceInstancePath : profile.DeviceInstancePaths) entries.emplace_back(ProfileDevicePrefix + deviceInstancePath);
+        DWORD needed{};
+        auto request{ HidHide::StringListToMultiString(entries) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_SET_PROFILE), request.data(), static_cast<DWORD>(request.size() * sizeof(WCHAR)), nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+    }
+
+    // Delete an application profile
+    void DeleteProfile(_In_ HANDLE device, _In_ std::wstring const& name)
+    {
+        TRACE_ALWAYS(L"");
+        DWORD needed{};
+        auto request{ HidHide::StringListToMultiString({ name }) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_DEL_PROFILE), request.data(), static_cast<DWORD>(request.size() * sizeof(WCHAR)), nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+    }
+
+    // Get the name of the currently active application profile (empty when none)
+    std::wstring GetActiveProfileName(_In_ HANDLE device)
+    {
+        TRACE_ALWAYS(L"");
+        DWORD needed{};
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_ACTIVE_PROFILE), nullptr, 0, nullptr, 0, &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        auto buffer{ std::vector<WCHAR>(needed / sizeof(WCHAR)) };
+        if (FALSE == ::DeviceIoControl(device, static_cast<DWORD>(IOCTL_GET_ACTIVE_PROFILE), nullptr, 0, buffer.data(), static_cast<DWORD>(buffer.size() * sizeof(WCHAR)), &needed, nullptr)) THROW_WIN32_LAST_ERROR;
+        auto const names{ HidHide::MultiStringToStringList(buffer) };
+        return (names.empty() ? std::wstring{} : names.at(0));
+    }
 }
 
 namespace HidHide
@@ -121,6 +211,7 @@ namespace HidHide
         , m_Blacklist{ ::GetBlacklist(m_Device.get()) }
         , m_Whitelist{ ::GetWhitelist(m_Device.get()) }
         , m_Inverse{ ::GetInverse(m_Device.get()) }
+        , m_Profiles{ ::GetProfiles(m_Device.get()) }
     {
         TRACE_ALWAYS(L"");
 
@@ -149,6 +240,21 @@ namespace HidHide
         if (::GetBlacklist(m_Device.get()) != m_Blacklist) ::SetBlacklist(m_Device.get(), m_Blacklist);
         if (::GetActive(m_Device.get()) != m_Active) ::SetActive(m_Device.get(), m_Active);
         if (::GetInverse(m_Device.get()) != m_Inverse) ::SetInverse(m_Device.get(), m_Inverse);
+
+        // Create or replace the desired profiles and delete the ones no longer present
+        auto const profilesOnDevice{ ::GetProfiles(m_Device.get()) };
+        for (auto const& profile : m_Profiles)
+        {
+            auto const it{ profilesOnDevice.find(profile.first) };
+            if ((std::end(profilesOnDevice) == it) || (it->second.Applications != profile.second.Applications) || (it->second.DeviceInstancePaths != profile.second.DeviceInstancePaths))
+            {
+                ::SetProfile(m_Device.get(), profile.first, profile.second);
+            }
+        }
+        for (auto const& profile : profilesOnDevice)
+        {
+            if (std::end(m_Profiles) == m_Profiles.find(profile.first)) ::DeleteProfile(m_Device.get(), profile.first);
+        }
     }
 
     bool FilterDriverProxy::GetActive() const
@@ -259,5 +365,84 @@ namespace HidHide
             m_Inverse = inverse;
             if (m_WriteThrough) ::SetInverse(m_Device.get(), m_Inverse);
         }
+    }
+
+    ApplicationProfiles FilterDriverProxy::GetProfiles() const
+    {
+        TRACE_ALWAYS(L"");
+        return (m_Profiles);
+    }
+
+    _Use_decl_annotations_
+    bool FilterDriverProxy::GetProfile(std::wstring const& name, ApplicationProfile& profile) const
+    {
+        TRACE_ALWAYS(L"");
+        auto const it{ m_Profiles.find(name) };
+        if (std::end(m_Profiles) == it) return (false);
+        profile = it->second;
+        return (true);
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::SetProfile(std::wstring const& name, ApplicationProfile const& profile)
+    {
+        TRACE_ALWAYS(L"");
+        m_Profiles[name] = profile;
+        if (m_WriteThrough) ::SetProfile(m_Device.get(), name, profile);
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::DeleteProfile(std::wstring const& name)
+    {
+        TRACE_ALWAYS(L"");
+        if ((m_Profiles.erase(name) > 0) && (m_WriteThrough)) ::DeleteProfile(m_Device.get(), name);
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::ProfileApplicationsAddEntry(std::wstring const& name, FullImageName const& fullImageName)
+    {
+        TRACE_ALWAYS(L"");
+        if (m_Profiles[name].Applications.emplace(fullImageName).second)
+        {
+            if (m_WriteThrough) ::SetProfile(m_Device.get(), name, m_Profiles[name]);
+        }
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::ProfileApplicationsDelEntry(std::wstring const& name, FullImageName const& fullImageName)
+    {
+        TRACE_ALWAYS(L"");
+        auto const it{ m_Profiles.find(name) };
+        if ((std::end(m_Profiles) != it) && (it->second.Applications.erase(fullImageName) > 0))
+        {
+            if (m_WriteThrough) ::SetProfile(m_Device.get(), name, it->second);
+        }
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::ProfileDeviceInstancePathsAddEntry(std::wstring const& name, DeviceInstancePath const& deviceInstancePath)
+    {
+        TRACE_ALWAYS(L"");
+        if (m_Profiles[name].DeviceInstancePaths.emplace(deviceInstancePath).second)
+        {
+            if (m_WriteThrough) ::SetProfile(m_Device.get(), name, m_Profiles[name]);
+        }
+    }
+
+    _Use_decl_annotations_
+    void FilterDriverProxy::ProfileDeviceInstancePathsDelEntry(std::wstring const& name, DeviceInstancePath const& deviceInstancePath)
+    {
+        TRACE_ALWAYS(L"");
+        auto const it{ m_Profiles.find(name) };
+        if ((std::end(m_Profiles) != it) && (it->second.DeviceInstancePaths.erase(deviceInstancePath) > 0))
+        {
+            if (m_WriteThrough) ::SetProfile(m_Device.get(), name, it->second);
+        }
+    }
+
+    std::wstring FilterDriverProxy::ActiveProfile() const
+    {
+        TRACE_ALWAYS(L"");
+        return (::GetActiveProfileName(m_Device.get()));
     }
 }

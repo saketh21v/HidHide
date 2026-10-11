@@ -15,6 +15,7 @@ ULONG PsGetProcessSessionId(PEPROCESS process);
 #define DRIVER_PROPERTY_WHITELISTED_INVERSE               L"WhitelistedInverse"             // HKLM\SYSTEM\CurrentControlSet\Services\HidHide\Parameters\WhitelistedInverse (DWORD)
 
 #include "HidHideIoctlContract.h"
+#include "Profiles.h"
 
 // {0C320FF7-BD9B-42B6-BDAF-49FEB9C91649}
 DEFINE_GUID(HidHideInterfaceGuid, 0xc320ff7, 0xbd9b, 0x42b6, 0xbd, 0xaf, 0x49, 0xfe, 0xb9, 0xc9, 0x16, 0x49);
@@ -47,6 +48,16 @@ typedef struct _CONTROL_DEVICE_CONTEXT
     // Collection of SESSION_BLACKLIST_ENTRY structures for process-lifetime blacklist entries
     // Entries are automatically removed when the registering process exits
     LIST_ENTRY sessionBlacklistHead;
+
+    // Collection of HIDHIDE_PROFILE structures loaded from the registry (the stored application profiles)
+    LIST_ENTRY profilesHead;
+
+    // Stack of HIDHIDE_PROFILE_ACTIVATION structures binding a running process to the profile it activated
+    // The tail of the list holds the most recently activated profile (last-started-wins)
+    LIST_ENTRY profileActivationStackHead;
+
+    // The profile currently in effect (the tail of the activation stack) or NULL when the persistent blacklist applies
+    struct _HIDHIDE_PROFILE* activeProfile;
 
     // During a shutdown we may only delete the control device object after the last device is removed so keep track of the number of devices and shutdown state
     BOOLEAN shutdownPending;
@@ -166,10 +177,86 @@ _IRQL_requires_same_
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS OnControlDeviceIoClearSessionBlacklist(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
 
+// Handle GetProfiles I/O request from client
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS OnControlDeviceIoGetProfiles(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
+
+// Handle GetProfile I/O request from client
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS OnControlDeviceIoGetProfile(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
+
+// Handle SetProfile I/O request from client
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS OnControlDeviceIoSetProfile(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
+
+// Handle DelProfile I/O request from client
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS OnControlDeviceIoDelProfile(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
+
+// Handle GetActiveProfile I/O request from client
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS OnControlDeviceIoGetActiveProfile(_In_ WDFDEVICE wdfDevice, _In_ WDFQUEUE wdfQueue, _In_ WDFREQUEST wdfRequest, _In_ size_t outputBufferLength, _In_ size_t inputBufferLength, _In_ ULONG ioControlCode);
+
 // Remove all session blacklist entries owned by the given process ID
 _IRQL_requires_same_
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID SessionBlacklistCleanupForPid(_In_ HANDLE processId);
+
+// Load all stored application profiles into the control device context
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS ProfilesLoadAll(_In_ PCONTROL_DEVICE_CONTEXT pControlDeviceContext);
+
+// Release all application profiles and activation entries held by the control device context
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID ProfilesFreeAll(_In_ PCONTROL_DEVICE_CONTEXT pControlDeviceContext);
+
+// Activate the profile bound to the full image name provided (when any), binding it to the process id
+// A later activation takes precedence over an earlier one (last-started-wins)
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+VOID ProfilesTryActivate(_In_ HANDLE processId, _In_ PUNICODE_STRING fullImageName);
+
+// Remove all activation entries owned by the given process ID and recompute the active profile
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID ProfilesDeactivateForPid(_In_ HANDLE processId);
+
+// Remove a profile by name: its activation entries, its in-memory copy, and its stored definition
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+VOID ProfilesPurgeByName(_In_ PCUNICODE_STRING profileName);
+
+// Get the names of all loaded profiles in a multi-string format
+// When the supplied buffer is NULL, the method returns STATUS_SUCCESS and indicates the buffer size needed for the multi-string (incl. terminator)
+// When the supplied buffer isn't NULL, the names will be copied into the buffer, providing the buffer is large enough for holding the result
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS ProfilesGetNames(_Out_writes_to_opt_(bufferSizeInCharacters, *neededSizeInCharacters) LPWSTR buffer, _In_ size_t bufferSizeInCharacters, _Out_ size_t* neededSizeInCharacters);
+
+// Get a single profile in a multi-string format (name first, then the entries tagged with DRIVER_PROFILE_ENTRY_APPLICATION_PREFIX / DRIVER_PROFILE_ENTRY_DEVICE_PREFIX)
+// When the supplied buffer is NULL, the method returns STATUS_SUCCESS and indicates the buffer size needed for the multi-string (incl. terminator)
+// Returns STATUS_OBJECT_NAME_NOT_FOUND (Error) when the profile doesn't exist
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS ProfilesGetOne(_In_ PCUNICODE_STRING profileName, _Out_writes_to_opt_(bufferSizeInCharacters, *neededSizeInCharacters) LPWSTR buffer, _In_ size_t bufferSizeInCharacters, _Out_ size_t* neededSizeInCharacters);
+
+// Create or replace a profile from the two collections of string objects provided (applications and blacklisted device instance paths)
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS ProfilesSetOne(_In_ PCUNICODE_STRING profileName, _In_ WDFCOLLECTION applications, _In_ WDFCOLLECTION blacklistedDeviceInstancePaths);
+
+// Get the name of the currently active profile (empty when none) in a multi-string format
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS ProfilesGetActiveName(_Out_writes_to_opt_(bufferSizeInCharacters, *neededSizeInCharacters) LPWSTR buffer, _In_ size_t bufferSizeInCharacters, _Out_ size_t* neededSizeInCharacters);
+
 
 // Is the process id on the whitelist?
 // On a match, the cache-hit indicates if its the first time or not

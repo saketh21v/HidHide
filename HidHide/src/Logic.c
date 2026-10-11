@@ -11,6 +11,12 @@
 // Unique memory pool tag for buffers
 #define LOGIC_TAG 'oLHH'
 
+// Unique memory pool tag for the profile activation stack entries
+#define PROFILES_ACTIVATION_TAG 'aPHH'
+
+// Unique memory pool tag for the temporary buffers holding prefixed profile entries
+#define PROFILES_STRING_TAG 'sPHH'
+
 // The control device is created first and should be deleted last after having release the driver resources
 // Releasing the control device is required else the driver will never unload
 WDFDEVICE s_wdfControlDevice = NULL;
@@ -89,6 +95,9 @@ VOID OnControlDeviceContextCleanup(WDFOBJECT wdfControlDeviceObject)
         entry = next;
     }
     if (NULL != s_criticalSectionLock) WdfWaitLockRelease(s_criticalSectionLock);
+
+    // Release the application profiles and their activation entries
+    ProfilesFreeAll(pControlDeviceContext);
 }
 
 _Use_decl_annotations_
@@ -103,6 +112,7 @@ VOID OnSystemProcessChange(HANDLE parentId, HANDLE processId, BOOLEAN create)
     {
         HidHideProcessIdUnregister(s_criticalSectionLock, processId);
         SessionBlacklistCleanupForPid(processId);
+        ProfilesDeactivateForPid(processId);
     }
 }
 
@@ -116,7 +126,11 @@ VOID OnSystemLoadImage(PUNICODE_STRING fullImageName, HANDLE processId, PIMAGE_I
     if ((NULL != fullImageName) && (NULL != processId))
     {
         // Only process the first load attempt as this is the executable; subsequent calls are for its load modules
-        HidHideProcessIdRegister(s_criticalSectionLock, processId, fullImageName);
+        if (STATUS_SUCCESS == HidHideProcessIdRegister(s_criticalSectionLock, processId, fullImageName))
+        {
+            // A newly registered process may activate the application profile bound to its executable
+            ProfilesTryActivate(processId, fullImageName);
+        }
     }
 }
 
@@ -278,6 +292,9 @@ NTSTATUS OnControlDeviceCreate(WDFDEVICE wdfControlDevice)
     pControlDeviceContext->numberOfDevicesCreated = 0;
     pControlDeviceContext->shutdownPending = FALSE;
     InitializeListHead(&pControlDeviceContext->sessionBlacklistHead);
+    InitializeListHead(&pControlDeviceContext->profilesHead);
+    InitializeListHead(&pControlDeviceContext->profileActivationStackHead);
+    pControlDeviceContext->activeProfile = NULL;
 
     // Query the multi-string property containing the white-listed full image names
     DECLARE_CONST_UNICODE_STRING(whitelistedFullImageNames, DRIVER_PROPERTY_WHITELISTED_FULL_IMAGE_NAMES);
@@ -301,6 +318,10 @@ NTSTATUS OnControlDeviceCreate(WDFDEVICE wdfControlDevice)
     // Query the boolean property indicating the inverse state
     DECLARE_CONST_UNICODE_STRING(whitelistedInverse, DRIVER_PROPERTY_WHITELISTED_INVERSE);
     ntstatus = HidHideDriverGetBooleanProperty(&whitelistedInverse, &pControlDeviceContext->whitelistedInverse);
+    if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+
+    // Load the stored application profiles
+    ntstatus = ProfilesLoadAll(pControlDeviceContext);
     if (!NT_SUCCESS(ntstatus)) return (ntstatus);
 
     return (STATUS_SUCCESS);
@@ -363,6 +384,21 @@ NTSTATUS OnControlDeviceIoDeviceControl(WDFDEVICE wdfControlDevice, WDFQUEUE wdf
         break;
     case IOCTL_CLR_SESSION_BLACKLIST:
         return (OnControlDeviceIoClearSessionBlacklist(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
+        break;
+    case IOCTL_GET_PROFILES:
+        return (OnControlDeviceIoGetProfiles(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
+        break;
+    case IOCTL_GET_PROFILE:
+        return (OnControlDeviceIoGetProfile(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
+        break;
+    case IOCTL_SET_PROFILE:
+        return (OnControlDeviceIoSetProfile(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
+        break;
+    case IOCTL_DEL_PROFILE:
+        return (OnControlDeviceIoDelProfile(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
+        break;
+    case IOCTL_GET_ACTIVE_PROFILE:
+        return (OnControlDeviceIoGetActiveProfile(wdfControlDevice, wdfQueue, wdfRequest, outputBufferLength, inputBufferLength, ioControlCode));
         break;
     default:
         LOG_AND_RETURN_NTSTATUS(L"OnControlDeviceIoDeviceControl", STATUS_INVALID_PARAMETER);
@@ -798,6 +834,7 @@ BOOLEAN Blacklisted(PUNICODE_STRING deviceInstancePath, ULONG sessionId)
     PCONTROL_DEVICE_CONTEXT  pControlDeviceContext;
     UNICODE_STRING           inputFilter;
     UNICODE_STRING           blacklistedDeviceInstancePath;
+    WDFCOLLECTION            deviceInstancePaths;
     ULONG                    jailSessionId;
     PLIST_ENTRY              entry;
     PSESSION_BLACKLIST_ENTRY sbe;
@@ -805,10 +842,13 @@ BOOLEAN Blacklisted(PUNICODE_STRING deviceInstancePath, ULONG sessionId)
     WdfWaitLockAcquire(s_criticalSectionLock, NULL);
     pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
 
-    // Check persistent blacklist
-    for (ULONG index1 = 0, size1 = WdfCollectionGetCount(pControlDeviceContext->blacklistedDeviceInstancePaths); (index1 < size1); index1++)
+    // The device set in effect is the active profile's set when a profile is active, else the persistent blacklist
+    deviceInstancePaths = ((NULL != pControlDeviceContext->activeProfile) ? pControlDeviceContext->activeProfile->blacklistedDeviceInstancePaths : pControlDeviceContext->blacklistedDeviceInstancePaths);
+
+    // Check the device set in effect
+    for (ULONG index1 = 0, size1 = WdfCollectionGetCount(deviceInstancePaths); (index1 < size1); index1++)
     {
-        WdfStringGetUnicodeString(WdfCollectionGetItem(pControlDeviceContext->blacklistedDeviceInstancePaths, index1), &inputFilter); // PASSIVE_LEVEL
+        WdfStringGetUnicodeString(WdfCollectionGetItem(deviceInstancePaths, index1), &inputFilter); // PASSIVE_LEVEL
         SplitDeviceData(&inputFilter, &blacklistedDeviceInstancePath, &jailSessionId);
 
         if (0 == RtlCompareUnicodeString(&blacklistedDeviceInstancePath, deviceInstancePath, TRUE))
@@ -1053,4 +1093,782 @@ VOID UpdateDataForControlDeviceDeletionAndDeleteControlDeviceWhenNeeded(INT32 in
         WdfObjectDelete(s_wdfControlDevice);
         s_wdfControlDevice = NULL;
     }
+}
+
+// Unique memory pool tag for the application profile structures
+#define PROFILES_PROFILE_TAG 'fPHH'
+
+// Create a string object holding a copy of the value provided and parent it to the object provided
+// The handle is deliberately discarded: the string object is released together with its parent
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS CreateChildString(_In_ WDFOBJECT parent, _In_ PCUNICODE_STRING value)
+{
+    TRACE_PERFORMANCE(L"");
+
+    WDF_OBJECT_ATTRIBUTES wdfObjectAttributes;
+    WDFSTRING             string;
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&wdfObjectAttributes);
+    wdfObjectAttributes.ParentObject = parent;
+    return (WdfStringCreate(value, &wdfObjectAttributes, &string));
+}
+
+// Find a profile by name (compared ignoring case) in the control device context provided
+// Returns NULL when no profile with the given name is loaded
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static PHIDHIDE_PROFILE FindProfileByName(_In_ PCONTROL_DEVICE_CONTEXT pControlDeviceContext, _In_ PCUNICODE_STRING profileName)
+{
+    TRACE_PERFORMANCE(L"");
+
+    UNICODE_STRING name;
+
+    for (PLIST_ENTRY entry = pControlDeviceContext->profilesHead.Flink; entry != &pControlDeviceContext->profilesHead; entry = entry->Flink)
+    {
+        PHIDHIDE_PROFILE profile = CONTAINING_RECORD(entry, HIDHIDE_PROFILE, listEntry);
+        WdfStringGetUnicodeString(profile->name, &name); // PASSIVE_LEVEL
+        if (0 == RtlCompareUnicodeString(&name, profileName, TRUE)) return (profile);
+    }
+
+    return (NULL);
+}
+
+// Determine the profile in effect from the activation stack (the most recently activated one, i.e. the tail)
+// Returns NULL when the stack is empty (the persistent blacklist applies)
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PHIDHIDE_PROFILE ActiveProfileFromStack(_In_ PCONTROL_DEVICE_CONTEXT pControlDeviceContext)
+{
+    TRACE_PERFORMANCE(L"");
+
+    if (IsListEmpty(&pControlDeviceContext->profileActivationStackHead)) return (NULL);
+
+    PHIDHIDE_PROFILE_ACTIVATION activation = CONTAINING_RECORD(pControlDeviceContext->profileActivationStackHead.Blink, HIDHIDE_PROFILE_ACTIVATION, listEntry);
+    return (activation->profile);
+}
+
+// Does the full image name provided match one of the applications bound to the profile?
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static BOOLEAN ProfileMatchesImage(_In_ PHIDHIDE_PROFILE profile, _In_ PUNICODE_STRING fullImageName)
+{
+    TRACE_PERFORMANCE(L"");
+
+    UNICODE_STRING image;
+
+    for (ULONG index = 0, size = WdfCollectionGetCount(profile->applications); (index < size); index++)
+    {
+        WdfStringGetUnicodeString(WdfCollectionGetItem(profile->applications, index), &image); // PASSIVE_LEVEL
+        if (0 == RtlCompareUnicodeString(&image, fullImageName, TRUE)) return (TRUE);
+    }
+
+    return (FALSE);
+}
+
+// Is the profile name provided acceptable as a registry key name?
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN IsValidProfileName(_In_ PCUNICODE_STRING profileName)
+{
+    TRACE_PERFORMANCE(L"");
+
+    if ((0 == profileName->Length) || (profileName->Length > (DRIVER_PROFILE_NAME_MAX_LENGTH * sizeof(WCHAR)))) return (FALSE);
+
+    // Reject the key-path separator as it would address a different key
+    for (USHORT index = 0; index < (profileName->Length / sizeof(WCHAR)); index++)
+    {
+        if (L'\\' == profileName->Buffer[index]) return (FALSE);
+    }
+
+    return (TRUE);
+}
+
+// Create a profile structure from the name and the two collections of string objects provided
+// On success the profile takes ownership of both collections (as well as its own name string)
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS ProfileCreate(_In_ PCUNICODE_STRING profileName, _In_ WDFCOLLECTION applications, _In_ WDFCOLLECTION blacklistedDeviceInstancePaths, _Out_ PHIDHIDE_PROFILE* profile)
+{
+    TRACE_PERFORMANCE(L"");
+
+    PHIDHIDE_PROFILE newProfile;
+    NTSTATUS         ntstatus;
+
+    (*profile) = NULL;
+
+    newProfile = (PHIDHIDE_PROFILE)ExAllocatePoolWithTag(NonPagedPool, sizeof(*newProfile), PROFILES_PROFILE_TAG);
+    if (NULL == newProfile) LOG_AND_RETURN_NTSTATUS(L"ExAllocatePoolWithTag", STATUS_INSUFFICIENT_RESOURCES);
+    RtlZeroMemory(newProfile, sizeof(*newProfile));
+    InitializeListHead(&newProfile->listEntry);
+
+    ntstatus = WdfStringCreate(profileName, WDF_NO_OBJECT_ATTRIBUTES, &newProfile->name);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        ExFreePoolWithTag(newProfile, PROFILES_PROFILE_TAG);
+        LOG_AND_RETURN_NTSTATUS(L"WdfStringCreate", ntstatus);
+    }
+
+    newProfile->applications = applications;
+    newProfile->blacklistedDeviceInstancePaths = blacklistedDeviceInstancePaths;
+    (*profile) = newProfile;
+    return (STATUS_SUCCESS);
+}
+
+// Release a profile structure and the string objects it owns
+_IRQL_requires_same_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID ProfileFree(_In_ PHIDHIDE_PROFILE profile)
+{
+    TRACE_PERFORMANCE(L"");
+
+    if (NULL != profile->name) WdfObjectDelete(profile->name);
+    if (NULL != profile->applications) WdfObjectDelete(profile->applications);
+    if (NULL != profile->blacklistedDeviceInstancePaths) WdfObjectDelete(profile->blacklistedDeviceInstancePaths);
+    ExFreePoolWithTag(profile, PROFILES_PROFILE_TAG);
+}
+
+// Append a copy of every string object of the source collection to the destination collection
+// The copies are parented to the destination collection
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS DuplicateCollectionInto(_In_ WDFCOLLECTION source, _In_ WDFCOLLECTION destination)
+{
+    TRACE_PERFORMANCE(L"");
+
+    UNICODE_STRING string;
+    NTSTATUS       ntstatus;
+
+    for (ULONG index = 0, size = WdfCollectionGetCount(source); (index < size); index++)
+    {
+        WdfStringGetUnicodeString(WdfCollectionGetItem(source, index), &string); // PASSIVE_LEVEL
+        ntstatus = CreateChildString(destination, &string);
+        if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfStringCreate", ntstatus);
+    }
+
+    return (STATUS_SUCCESS);
+}
+
+// Append a string object holding the prefix followed by the value provided to the collection
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static NTSTATUS AddPrefixedStringToCollection(_In_ WDFCOLLECTION collection, _In_ PCWSTR prefix, _In_ PCUNICODE_STRING value)
+{
+    TRACE_PERFORMANCE(L"");
+
+    UNICODE_STRING string;
+    size_t         prefixInCharacters;
+    size_t         valueInCharacters;
+    LPWSTR         buffer;
+    NTSTATUS       ntstatus;
+
+    prefixInCharacters = wcsnlen(prefix, DRIVER_PROFILE_NAME_MAX_LENGTH);
+    valueInCharacters = (value->Length / sizeof(WCHAR));
+
+    buffer = (LPWSTR)ExAllocatePoolWithTag(NonPagedPool, ((prefixInCharacters + valueInCharacters + 1) * sizeof(WCHAR)), PROFILES_STRING_TAG);
+    if (NULL == buffer) LOG_AND_RETURN_NTSTATUS(L"ExAllocatePoolWithTag", STATUS_INSUFFICIENT_RESOURCES);
+
+    RtlCopyMemory(buffer, prefix, (prefixInCharacters * sizeof(WCHAR)));
+    RtlCopyMemory(&buffer[prefixInCharacters], value->Buffer, (valueInCharacters * sizeof(WCHAR)));
+    buffer[prefixInCharacters + valueInCharacters] = L'\0';
+
+    string.Buffer = buffer;
+    string.Length = (USHORT)((prefixInCharacters + valueInCharacters) * sizeof(WCHAR));
+    string.MaximumLength = string.Length + sizeof(WCHAR);
+    ntstatus = CreateChildString(collection, &string);
+    ExFreePoolWithTag(buffer, PROFILES_STRING_TAG);
+
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfStringCreate", ntstatus);
+
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+NTSTATUS ProfilesLoadAll(PCONTROL_DEVICE_CONTEXT pControlDeviceContext)
+{
+    TRACE_ALWAYS(L"");
+
+    WDFCOLLECTION profileNames;
+    UNICODE_STRING name;
+    NTSTATUS      ntstatus;
+
+    // Enumerate the stored profiles (an absent store yields an empty set which is a normal condition)
+    ntstatus = HidHideProfileStoreList(&profileNames);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        // A failure to read the store must not prevent the driver from initializing
+        TRACE_ALWAYS(L"Unable to enumerate the application profile store");
+        return (STATUS_SUCCESS);
+    }
+
+    for (ULONG index = 0, size = WdfCollectionGetCount(profileNames); (index < size); index++)
+    {
+        WDFCOLLECTION    applications;
+        WDFCOLLECTION    blacklistedDeviceInstancePaths;
+        PHIDHIDE_PROFILE profile;
+
+        WdfStringGetUnicodeString(WdfCollectionGetItem(profileNames, index), &name); // PASSIVE_LEVEL
+
+        // Skip malformed or unreadable entries rather than failing the entire load
+        if (STATUS_PROCESS_IN_JOB != HidHideProfileStoreRead(&name, &applications, &blacklistedDeviceInstancePaths)) continue;
+        if (!NT_SUCCESS(ProfileCreate(&name, applications, blacklistedDeviceInstancePaths, &profile)))
+        {
+            WdfObjectDelete(applications);
+            WdfObjectDelete(blacklistedDeviceInstancePaths);
+            continue;
+        }
+
+        InsertTailList(&pControlDeviceContext->profilesHead, &profile->listEntry);
+    }
+
+    WdfObjectDelete(profileNames);
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+VOID ProfilesFreeAll(PCONTROL_DEVICE_CONTEXT pControlDeviceContext)
+{
+    TRACE_ALWAYS(L"");
+
+    if (NULL != s_criticalSectionLock) WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+
+    // Release the activation entries
+    PLIST_ENTRY entry = pControlDeviceContext->profileActivationStackHead.Flink;
+    while (entry != &pControlDeviceContext->profileActivationStackHead)
+    {
+        PHIDHIDE_PROFILE_ACTIVATION activation = CONTAINING_RECORD(entry, HIDHIDE_PROFILE_ACTIVATION, listEntry);
+        PLIST_ENTRY next = entry->Flink;
+        RemoveEntryList(entry);
+        ExFreePoolWithTag(activation, PROFILES_ACTIVATION_TAG);
+        entry = next;
+    }
+
+    // Release the profiles
+    entry = pControlDeviceContext->profilesHead.Flink;
+    while (entry != &pControlDeviceContext->profilesHead)
+    {
+        PHIDHIDE_PROFILE profile = CONTAINING_RECORD(entry, HIDHIDE_PROFILE, listEntry);
+        PLIST_ENTRY next = entry->Flink;
+        RemoveEntryList(entry);
+        ProfileFree(profile);
+        entry = next;
+    }
+
+    pControlDeviceContext->activeProfile = NULL;
+
+    if (NULL != s_criticalSectionLock) WdfWaitLockRelease(s_criticalSectionLock);
+}
+
+_Use_decl_annotations_
+VOID ProfilesTryActivate(HANDLE processId, PUNICODE_STRING fullImageName)
+{
+    TRACE_PERFORMANCE(L"");
+
+    PCONTROL_DEVICE_CONTEXT pControlDeviceContext;
+
+    if (NULL == s_wdfControlDevice) return;
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+
+    for (PLIST_ENTRY entry = pControlDeviceContext->profilesHead.Flink; entry != &pControlDeviceContext->profilesHead; entry = entry->Flink)
+    {
+        PHIDHIDE_PROFILE profile = CONTAINING_RECORD(entry, HIDHIDE_PROFILE, listEntry);
+        if (!ProfileMatchesImage(profile, fullImageName)) continue;
+
+        // Bind the process to the profile and make it the profile in effect (last-started-wins)
+        PHIDHIDE_PROFILE_ACTIVATION activation = (PHIDHIDE_PROFILE_ACTIVATION)ExAllocatePoolWithTag(NonPagedPool, sizeof(*activation), PROFILES_ACTIVATION_TAG);
+        if (NULL != activation)
+        {
+            activation->processId = processId;
+            activation->profile = profile;
+            InsertTailList(&pControlDeviceContext->profileActivationStackHead, &activation->listEntry);
+            pControlDeviceContext->activeProfile = profile;
+            TRACE_ALWAYS(L"Application profile activated");
+        }
+        break;
+    }
+
+    WdfWaitLockRelease(s_criticalSectionLock);
+}
+
+_Use_decl_annotations_
+VOID ProfilesDeactivateForPid(HANDLE processId)
+{
+    TRACE_PERFORMANCE(L"");
+
+    PCONTROL_DEVICE_CONTEXT pControlDeviceContext;
+
+    if (NULL == s_wdfControlDevice) return;
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+
+    PLIST_ENTRY entry = pControlDeviceContext->profileActivationStackHead.Flink;
+    while (entry != &pControlDeviceContext->profileActivationStackHead)
+    {
+        PHIDHIDE_PROFILE_ACTIVATION activation = CONTAINING_RECORD(entry, HIDHIDE_PROFILE_ACTIVATION, listEntry);
+        PLIST_ENTRY next = entry->Flink;
+        if (activation->processId == processId)
+        {
+            RemoveEntryList(entry);
+            ExFreePoolWithTag(activation, PROFILES_ACTIVATION_TAG);
+        }
+        entry = next;
+    }
+
+    pControlDeviceContext->activeProfile = ActiveProfileFromStack(pControlDeviceContext);
+
+    WdfWaitLockRelease(s_criticalSectionLock);
+}
+
+_Use_decl_annotations_
+VOID ProfilesPurgeByName(PCUNICODE_STRING profileName)
+{
+    TRACE_ALWAYS(L"");
+
+    PCONTROL_DEVICE_CONTEXT pControlDeviceContext;
+    PHIDHIDE_PROFILE         target;
+
+    // Remove the stored definition first (PASSIVE_LEVEL registry access)
+    HidHideProfileStoreDelete(profileName);
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+    target = FindProfileByName(pControlDeviceContext, profileName);
+
+    if (NULL != target)
+    {
+        // Drop the activation entries referencing the profile and release the profile itself
+        PLIST_ENTRY entry = pControlDeviceContext->profileActivationStackHead.Flink;
+        while (entry != &pControlDeviceContext->profileActivationStackHead)
+        {
+            PHIDHIDE_PROFILE_ACTIVATION activation = CONTAINING_RECORD(entry, HIDHIDE_PROFILE_ACTIVATION, listEntry);
+            PLIST_ENTRY next = entry->Flink;
+            if (activation->profile == target)
+            {
+                RemoveEntryList(entry);
+                ExFreePoolWithTag(activation, PROFILES_ACTIVATION_TAG);
+            }
+            entry = next;
+        }
+
+        RemoveEntryList(&target->listEntry);
+        ProfileFree(target);
+        pControlDeviceContext->activeProfile = ActiveProfileFromStack(pControlDeviceContext);
+    }
+
+    WdfWaitLockRelease(s_criticalSectionLock);
+}
+
+_Use_decl_annotations_
+NTSTATUS ProfilesGetNames(LPWSTR buffer, size_t bufferSizeInCharacters, size_t* neededSizeInCharacters)
+{
+    TRACE_ALWAYS(L"");
+
+    WDFCOLLECTION         names;
+    PCONTROL_DEVICE_CONTEXT pControlDeviceContext;
+    UNICODE_STRING        name;
+    NTSTATUS              ntstatus;
+
+    ntstatus = WdfCollectionCreate(NULL, &names);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+    for (PLIST_ENTRY entry = pControlDeviceContext->profilesHead.Flink; entry != &pControlDeviceContext->profilesHead; entry = entry->Flink)
+    {
+        PHIDHIDE_PROFILE profile = CONTAINING_RECORD(entry, HIDHIDE_PROFILE, listEntry);
+        WdfStringGetUnicodeString(profile->name, &name); // PASSIVE_LEVEL
+        ntstatus = CreateChildString(names, &name);
+        if (!NT_SUCCESS(ntstatus)) break;
+    }
+    WdfWaitLockRelease(s_criticalSectionLock);
+
+    if (NT_SUCCESS(ntstatus)) ntstatus = HidHideCollectionToMultiString(names, buffer, bufferSizeInCharacters, neededSizeInCharacters);
+    WdfObjectDelete(names);
+
+    return (ntstatus);
+}
+
+_Use_decl_annotations_
+NTSTATUS ProfilesGetActiveName(LPWSTR buffer, size_t bufferSizeInCharacters, size_t* neededSizeInCharacters)
+{
+    TRACE_ALWAYS(L"");
+
+    WDFCOLLECTION            entries;
+    PCONTROL_DEVICE_CONTEXT  pControlDeviceContext;
+    UNICODE_STRING           name;
+    NTSTATUS                 ntstatus;
+
+    ntstatus = WdfCollectionCreate(NULL, &entries);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+    if (NULL != pControlDeviceContext->activeProfile)
+    {
+        WdfStringGetUnicodeString(pControlDeviceContext->activeProfile->name, &name); // PASSIVE_LEVEL
+        ntstatus = CreateChildString(entries, &name);
+    }
+    WdfWaitLockRelease(s_criticalSectionLock);
+
+    if (NT_SUCCESS(ntstatus)) ntstatus = HidHideCollectionToMultiString(entries, buffer, bufferSizeInCharacters, neededSizeInCharacters);
+    WdfObjectDelete(entries);
+
+    return (ntstatus);
+}
+
+_Use_decl_annotations_
+NTSTATUS ProfilesGetOne(PCUNICODE_STRING profileName, LPWSTR buffer, size_t bufferSizeInCharacters, size_t* neededSizeInCharacters)
+{
+    TRACE_ALWAYS(L"");
+
+    WDFCOLLECTION            entries;
+    PCONTROL_DEVICE_CONTEXT  pControlDeviceContext;
+    PHIDHIDE_PROFILE         profile;
+    UNICODE_STRING           name;
+    UNICODE_STRING           value;
+    NTSTATUS                 ntstatus;
+
+    ntstatus = WdfCollectionCreate(NULL, &entries);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+    profile = FindProfileByName(pControlDeviceContext, profileName);
+
+    if (NULL != profile)
+    {
+        // The profile name comes first, then the entries tagged as application or device
+        WdfStringGetUnicodeString(profile->name, &name); // PASSIVE_LEVEL
+        ntstatus = CreateChildString(entries, &name);
+
+        for (ULONG index = 0; NT_SUCCESS(ntstatus) && (index < WdfCollectionGetCount(profile->applications)); index++)
+        {
+            WdfStringGetUnicodeString(WdfCollectionGetItem(profile->applications, index), &value);
+            ntstatus = AddPrefixedStringToCollection(entries, DRIVER_PROFILE_ENTRY_APPLICATION_PREFIX, &value);
+        }
+        for (ULONG index = 0; NT_SUCCESS(ntstatus) && (index < WdfCollectionGetCount(profile->blacklistedDeviceInstancePaths)); index++)
+        {
+            WdfStringGetUnicodeString(WdfCollectionGetItem(profile->blacklistedDeviceInstancePaths, index), &value);
+            ntstatus = AddPrefixedStringToCollection(entries, DRIVER_PROFILE_ENTRY_DEVICE_PREFIX, &value);
+        }
+    }
+    WdfWaitLockRelease(s_criticalSectionLock);
+
+    if (NULL == profile)
+    {
+        WdfObjectDelete(entries);
+        LOG_AND_RETURN_NTSTATUS(L"FindProfileByName", STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+
+    if (NT_SUCCESS(ntstatus)) ntstatus = HidHideCollectionToMultiString(entries, buffer, bufferSizeInCharacters, neededSizeInCharacters);
+    WdfObjectDelete(entries);
+
+    return (ntstatus);
+}
+
+_Use_decl_annotations_
+NTSTATUS ProfilesSetOne(PCUNICODE_STRING profileName, WDFCOLLECTION applications, WDFCOLLECTION blacklistedDeviceInstancePaths)
+{
+    TRACE_ALWAYS(L"");
+
+    WDFCOLLECTION            dupApplications;
+    WDFCOLLECTION            dupBlacklistedDeviceInstancePaths;
+    PCONTROL_DEVICE_CONTEXT  pControlDeviceContext;
+    PHIDHIDE_PROFILE         newProfile;
+    PHIDHIDE_PROFILE         existing;
+    NTSTATUS                 ntstatus;
+
+    // Build profile-owned copies of the supplied sets (the caller retains ownership of the originals)
+    ntstatus = WdfCollectionCreate(NULL, &dupApplications);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+    ntstatus = DuplicateCollectionInto(applications, dupApplications);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        WdfObjectDelete(dupApplications);
+        return (ntstatus);
+    }
+    ntstatus = WdfCollectionCreate(NULL, &dupBlacklistedDeviceInstancePaths);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        WdfObjectDelete(dupApplications);
+        LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+    }
+    ntstatus = DuplicateCollectionInto(blacklistedDeviceInstancePaths, dupBlacklistedDeviceInstancePaths);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        WdfObjectDelete(dupBlacklistedDeviceInstancePaths);
+        WdfObjectDelete(dupApplications);
+        return (ntstatus);
+    }
+
+    // Build the profile structure upfront so no allocation happens while holding the lock
+    ntstatus = ProfileCreate(profileName, dupApplications, dupBlacklistedDeviceInstancePaths, &newProfile);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        WdfObjectDelete(dupBlacklistedDeviceInstancePaths);
+        WdfObjectDelete(dupApplications);
+        return (ntstatus);
+    }
+
+    // Persist the definition
+    ntstatus = HidHideProfileStoreWrite(profileName, applications, blacklistedDeviceInstancePaths);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        ProfileFree(newProfile);
+        return (ntstatus);
+    }
+
+    // Apply the change in memory
+    WdfWaitLockAcquire(s_criticalSectionLock, NULL);
+    pControlDeviceContext = ControlDeviceGetContext(s_wdfControlDevice);
+    existing = FindProfileByName(pControlDeviceContext, profileName);
+
+    if (NULL != existing)
+    {
+        // Replace the contents in place so any activation binding keeps referencing a live profile
+        if (NULL != existing->applications) WdfObjectDelete(existing->applications);
+        if (NULL != existing->blacklistedDeviceInstancePaths) WdfObjectDelete(existing->blacklistedDeviceInstancePaths);
+        existing->applications = newProfile->applications;
+        existing->blacklistedDeviceInstancePaths = newProfile->blacklistedDeviceInstancePaths;
+
+        // The freshly created name string is redundant for the replace case
+        WdfObjectDelete(newProfile->name);
+        ExFreePoolWithTag(newProfile, PROFILES_PROFILE_TAG);
+    }
+    else
+    {
+        InsertTailList(&pControlDeviceContext->profilesHead, &newProfile->listEntry);
+    }
+    WdfWaitLockRelease(s_criticalSectionLock);
+
+    return (STATUS_SUCCESS);
+}
+
+// Parse the first string of a multi-string buffer (the buffer has been validated to be well-formed)
+_IRQL_requires_same_
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID ParseFirstMultiString(_In_reads_(totalCharacters) LPWSTR buffer, _In_ size_t totalCharacters, _Out_ PUNICODE_STRING value)
+{
+    TRACE_PERFORMANCE(L"");
+
+    size_t length = wcsnlen(buffer, totalCharacters);
+    value->Buffer = buffer;
+    value->Length = (USHORT)(length * sizeof(WCHAR));
+    value->MaximumLength = (USHORT)((length + 1) * sizeof(WCHAR));
+}
+
+_Use_decl_annotations_
+NTSTATUS OnControlDeviceIoGetProfiles(WDFDEVICE wdfControlDevice, WDFQUEUE wdfQueue, WDFREQUEST wdfRequest, size_t outputBufferLength, size_t inputBufferLength, ULONG ioControlCode)
+{
+    TRACE_ALWAYS(L"");
+    UNREFERENCED_PARAMETER(wdfControlDevice);
+    UNREFERENCED_PARAMETER(wdfQueue);
+    UNREFERENCED_PARAMETER(ioControlCode);
+
+    LPWSTR   buffer;
+    size_t   neededSizeInCharacters;
+    NTSTATUS ntstatus;
+
+    if (0 != inputBufferLength) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    if (0 == outputBufferLength)
+    {
+        ntstatus = ProfilesGetNames(NULL, 0, &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+    else
+    {
+        ntstatus = WdfRequestRetrieveOutputBuffer(wdfRequest, outputBufferLength, &buffer, NULL);
+        if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveOutputBuffer", ntstatus);
+        ntstatus = ProfilesGetNames(buffer, (outputBufferLength / sizeof(WCHAR)), &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+
+    WdfRequestCompleteWithInformation(wdfRequest, STATUS_SUCCESS, (neededSizeInCharacters * sizeof(WCHAR)));
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+NTSTATUS OnControlDeviceIoGetProfile(WDFDEVICE wdfControlDevice, WDFQUEUE wdfQueue, WDFREQUEST wdfRequest, size_t outputBufferLength, size_t inputBufferLength, ULONG ioControlCode)
+{
+    TRACE_ALWAYS(L"");
+    UNREFERENCED_PARAMETER(wdfControlDevice);
+    UNREFERENCED_PARAMETER(wdfQueue);
+    UNREFERENCED_PARAMETER(ioControlCode);
+
+    LPWSTR         buffer;
+    size_t         totalChars;
+    UNICODE_STRING profileName;
+    size_t         neededSizeInCharacters;
+    NTSTATUS       ntstatus;
+
+    // Input is a multi-string holding the profile name
+    if (0 == inputBufferLength) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    if ((inputBufferLength < (2 * sizeof(WCHAR))) || (0 != (inputBufferLength % sizeof(WCHAR)))) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    ntstatus = WdfRequestRetrieveInputBuffer(wdfRequest, inputBufferLength, &buffer, NULL);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveInputBuffer", ntstatus);
+    totalChars = inputBufferLength / sizeof(WCHAR);
+    ParseFirstMultiString(buffer, totalChars, &profileName);
+    if (!IsValidProfileName(&profileName)) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+
+    if (0 == outputBufferLength)
+    {
+        ntstatus = ProfilesGetOne(&profileName, NULL, 0, &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+    else
+    {
+        ntstatus = WdfRequestRetrieveOutputBuffer(wdfRequest, outputBufferLength, &buffer, NULL);
+        if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveOutputBuffer", ntstatus);
+        ntstatus = ProfilesGetOne(&profileName, buffer, (outputBufferLength / sizeof(WCHAR)), &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+
+    WdfRequestCompleteWithInformation(wdfRequest, STATUS_SUCCESS, (neededSizeInCharacters * sizeof(WCHAR)));
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+NTSTATUS OnControlDeviceIoSetProfile(WDFDEVICE wdfControlDevice, WDFQUEUE wdfQueue, WDFREQUEST wdfRequest, size_t outputBufferLength, size_t inputBufferLength, ULONG ioControlCode)
+{
+    TRACE_ALWAYS(L"");
+    UNREFERENCED_PARAMETER(wdfControlDevice);
+    UNREFERENCED_PARAMETER(wdfQueue);
+    UNREFERENCED_PARAMETER(ioControlCode);
+
+    WDFCOLLECTION            applications;
+    WDFCOLLECTION            blacklistedDeviceInstancePaths;
+    LPWSTR                   buffer;
+    LPWSTR                   current;
+    size_t                   totalChars;
+    UNICODE_STRING           profileName;
+    NTSTATUS                 ntstatus;
+
+    if (0 != outputBufferLength) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    if ((inputBufferLength < (2 * sizeof(WCHAR))) || (0 != (inputBufferLength % sizeof(WCHAR)))) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    ntstatus = WdfRequestRetrieveInputBuffer(wdfRequest, inputBufferLength, &buffer, NULL);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveInputBuffer", ntstatus);
+
+    // Verify the buffer ends with a double-NUL as required by MULTI_SZ format
+    totalChars = inputBufferLength / sizeof(WCHAR);
+    if ((buffer[totalChars - 1] != L'\0') || (buffer[totalChars - 2] != L'\0')) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+
+    // The first string is the profile name
+    ParseFirstMultiString(buffer, totalChars, &profileName);
+    if (!IsValidProfileName(&profileName)) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+
+    ntstatus = WdfCollectionCreate(NULL, &applications);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+    ntstatus = WdfCollectionCreate(NULL, &blacklistedDeviceInstancePaths);
+    if (!NT_SUCCESS(ntstatus))
+    {
+        WdfObjectDelete(applications);
+        LOG_AND_RETURN_NTSTATUS(L"WdfCollectionCreate", ntstatus);
+    }
+
+    // Walk the remaining strings, dispatching each one on its tag prefix
+    ntstatus = STATUS_SUCCESS;
+    current = buffer;
+    while (NT_SUCCESS(ntstatus) && (*current != L'\0'))
+    {
+        size_t   remaining = totalChars - (size_t)(current - buffer);
+        size_t   len = wcsnlen(current, remaining);
+        WCHAR    prefix;
+        WDFCOLLECTION target;
+
+        if (len >= remaining)
+        {
+            ntstatus = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if ((current == buffer) || (len < 2) || (current[1] != L':'))
+        {
+            // Skip the profile name (first string) and reject malformed entries
+            if (current != buffer) ntstatus = STATUS_INVALID_PARAMETER;
+            current += len + 1;
+            continue;
+        }
+
+        prefix = current[0];
+        if ((prefix == L'A') || (prefix == L'a')) target = applications;
+        else if ((prefix == L'D') || (prefix == L'd')) target = blacklistedDeviceInstancePaths;
+        else { ntstatus = STATUS_INVALID_PARAMETER; break; }
+
+        UNICODE_STRING value;
+        value.Buffer = &current[2];
+        value.Length = (USHORT)((len - 2) * sizeof(WCHAR));
+        value.MaximumLength = value.Length + sizeof(WCHAR);
+        ntstatus = CreateChildString(target, &value);
+
+        current += len + 1;
+    }
+
+    if (NT_SUCCESS(ntstatus)) ntstatus = ProfilesSetOne(&profileName, applications, blacklistedDeviceInstancePaths);
+
+    WdfObjectDelete(blacklistedDeviceInstancePaths);
+    WdfObjectDelete(applications);
+
+    if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+
+    WdfRequestCompleteWithInformation(wdfRequest, STATUS_SUCCESS, inputBufferLength);
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+NTSTATUS OnControlDeviceIoDelProfile(WDFDEVICE wdfControlDevice, WDFQUEUE wdfQueue, WDFREQUEST wdfRequest, size_t outputBufferLength, size_t inputBufferLength, ULONG ioControlCode)
+{
+    TRACE_ALWAYS(L"");
+    UNREFERENCED_PARAMETER(wdfControlDevice);
+    UNREFERENCED_PARAMETER(wdfQueue);
+    UNREFERENCED_PARAMETER(ioControlCode);
+
+    LPWSTR         buffer;
+    size_t         totalChars;
+    UNICODE_STRING profileName;
+    NTSTATUS       ntstatus;
+
+    if (0 != outputBufferLength) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    if ((inputBufferLength < (2 * sizeof(WCHAR))) || (0 != (inputBufferLength % sizeof(WCHAR)))) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    ntstatus = WdfRequestRetrieveInputBuffer(wdfRequest, inputBufferLength, &buffer, NULL);
+    if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveInputBuffer", ntstatus);
+    totalChars = inputBufferLength / sizeof(WCHAR);
+    ParseFirstMultiString(buffer, totalChars, &profileName);
+    if (!IsValidProfileName(&profileName)) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+
+    ProfilesPurgeByName(&profileName);
+
+    WdfRequestCompleteWithInformation(wdfRequest, STATUS_SUCCESS, inputBufferLength);
+    return (STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+NTSTATUS OnControlDeviceIoGetActiveProfile(WDFDEVICE wdfControlDevice, WDFQUEUE wdfQueue, WDFREQUEST wdfRequest, size_t outputBufferLength, size_t inputBufferLength, ULONG ioControlCode)
+{
+    TRACE_ALWAYS(L"");
+    UNREFERENCED_PARAMETER(wdfControlDevice);
+    UNREFERENCED_PARAMETER(wdfQueue);
+    UNREFERENCED_PARAMETER(ioControlCode);
+
+    LPWSTR   buffer;
+    size_t   neededSizeInCharacters;
+    NTSTATUS ntstatus;
+
+    if (0 != inputBufferLength) LOG_AND_RETURN_NTSTATUS(L"Validation", STATUS_INVALID_PARAMETER);
+    if (0 == outputBufferLength)
+    {
+        ntstatus = ProfilesGetActiveName(NULL, 0, &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+    else
+    {
+        ntstatus = WdfRequestRetrieveOutputBuffer(wdfRequest, outputBufferLength, &buffer, NULL);
+        if (!NT_SUCCESS(ntstatus)) LOG_AND_RETURN_NTSTATUS(L"WdfRequestRetrieveOutputBuffer", ntstatus);
+        ntstatus = ProfilesGetActiveName(buffer, (outputBufferLength / sizeof(WCHAR)), &neededSizeInCharacters);
+        if (!NT_SUCCESS(ntstatus)) return (ntstatus);
+    }
+
+    WdfRequestCompleteWithInformation(wdfRequest, STATUS_SUCCESS, (neededSizeInCharacters * sizeof(WCHAR)));
+    return (STATUS_SUCCESS);
 }

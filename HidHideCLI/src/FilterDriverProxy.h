@@ -10,6 +10,16 @@ namespace HidHide
     typedef std::filesystem::path FullImageName;
     typedef std::set<FullImageName> FullImageNames;
 
+    // An application profile: a named set of bound applications and the devices hidden while the profile is active
+    struct ApplicationProfile
+    {
+        FullImageNames      Applications;      // The applications whose launch activates the profile
+        DeviceInstancePaths DeviceInstancePaths; // The devices hidden while the profile is active
+    };
+
+    // The set of application profiles keyed by (unique, case-insensitive) profile name
+    typedef std::map<std::wstring, ApplicationProfile> ApplicationProfiles;
+
     class FilterDriverProxy
     {
     public:
@@ -70,6 +80,33 @@ namespace HidHide
         // Set the current whitelist inverse state
         void SetInverse(_In_ bool inverse);
 
+        // Get the application profiles (keyed by profile name)
+        ApplicationProfiles GetProfiles() const;
+
+        // Get a single application profile by name; returns false when the profile isn't known
+        bool GetProfile(_In_ std::wstring const& name, _Out_ ApplicationProfile& profile) const;
+
+        // Create or replace an application profile
+        void SetProfile(_In_ std::wstring const& name, _In_ ApplicationProfile const& profile);
+
+        // Delete an application profile
+        void DeleteProfile(_In_ std::wstring const& name);
+
+        // Bind an application to an application profile
+        void ProfileApplicationsAddEntry(_In_ std::wstring const& name, _In_ FullImageName const& fullImageName);
+
+        // Unbind an application from an application profile
+        void ProfileApplicationsDelEntry(_In_ std::wstring const& name, _In_ FullImageName const& fullImageName);
+
+        // Add a device to an application profile
+        void ProfileDeviceInstancePathsAddEntry(_In_ std::wstring const& name, _In_ DeviceInstancePath const& deviceInstancePath);
+
+        // Remove a device from an application profile
+        void ProfileDeviceInstancePathsDelEntry(_In_ std::wstring const& name, _In_ DeviceInstancePath const& deviceInstancePath);
+
+        // Get the name of the currently active application profile (empty when none)
+        std::wstring ActiveProfile() const;
+
     private:
 
         typedef std::unique_ptr<std::remove_pointer<HANDLE>::type, decltype(&::CloseHandle)> CloseHandlePtr;
@@ -80,5 +117,6 @@ namespace HidHide
         DeviceInstancePaths  m_Blacklist;    // The device instance paths of the blacklisted HID devices
         FullImageNames       m_Whitelist;    // The full image names of the whitelisted applications
         bool                 m_Inverse;      // Indicates if the inverse whitelist is enabled
+        ApplicationProfiles  m_Profiles;     // The application profiles keyed by profile name
     };
 }

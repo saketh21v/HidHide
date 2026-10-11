@@ -27,6 +27,7 @@ CHidHideClientDlg::CHidHideClientDlg(CWnd* pParent)
     , m_TabApplication{}
     , m_BlacklistDlg(*this, nullptr)
     , m_WhitelistDlg(*this, nullptr)
+    , m_ProfilesDlg(*this, nullptr)
 {
     TRACE_ALWAYS(L"");
     m_hIcon = ::AfxGetApp()->LoadIcon(IDR_DIALOG_APPLICATION);
@@ -70,6 +71,9 @@ BOOL CHidHideClientDlg::OnInitDialog()
     auto tabApplicationHeader1{ HidHide::StringTable(IDS_TAB_APPLICATION_HEADER_1) };
     tcItem.pszText = tabApplicationHeader1.data();
     m_TabApplication.InsertItem(1, &tcItem);
+    auto tabApplicationHeader2{ HidHide::StringTable(IDS_TAB_APPLICATION_HEADER_2) };
+    tcItem.pszText = tabApplicationHeader2.data();
+    m_TabApplication.InsertItem(2, &tcItem);
 
     // Determine the proper offset for the tab dialogs
     CRect clientRect;
@@ -85,6 +89,8 @@ BOOL CHidHideClientDlg::OnInitDialog()
     m_BlacklistDlg.MoveWindow(clientRect);
     m_WhitelistDlg.Create(IDD_DIALOG_WHITELIST, m_TabApplication.GetWindow(IDD_DIALOG_WHITELIST));
     m_WhitelistDlg.MoveWindow(clientRect);
+    m_ProfilesDlg.Create(IDD_DIALOG_PROFILES, m_TabApplication.GetWindow(IDD_DIALOG_PROFILES));
+    m_ProfilesDlg.MoveWindow(clientRect);
 
     return (TRUE);
 }
@@ -129,12 +135,20 @@ void CHidHideClientDlg::ResyncTabDialogVisibilityState()
     case 0: // Applications
         m_BlacklistDlg.ShowWindow(SW_HIDE);
         m_WhitelistDlg.ShowWindow(SW_SHOW);
+        m_ProfilesDlg.ShowWindow(SW_HIDE);
         m_DropTarget.SetRedirectionTarget(m_WhitelistDlg);
         break;
     case 1: // Devices
         m_BlacklistDlg.ShowWindow(SW_SHOW);
         m_WhitelistDlg.ShowWindow(SW_HIDE);
+        m_ProfilesDlg.ShowWindow(SW_HIDE);
         m_DropTarget.SetRedirectionTarget(m_BlacklistDlg);
+        break;
+    case 2: // Profiles
+        m_BlacklistDlg.ShowWindow(SW_HIDE);
+        m_WhitelistDlg.ShowWindow(SW_HIDE);
+        m_ProfilesDlg.ShowWindow(SW_SHOW);
+        m_DropTarget.SetRedirectionTarget(m_ProfilesDlg);
         break;
     }
 }

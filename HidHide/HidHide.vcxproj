@@ -298,6 +298,7 @@
     <ClCompile Include="src\Driver.c" />
     <ClCompile Include="src\Logging.c" />
     <ClCompile Include="src\Logic.c" />
+    <ClCompile Include="src\Profiles.c" />
   </ItemGroup>
   <ItemDefinitionGroup>
     <CustomBuildStep>
@@ -327,6 +328,7 @@
     <ClInclude Include="src\Driver.h" />
     <ClInclude Include="src\Logging.h" />
     <ClInclude Include="src\Logic.h" />
+    <ClInclude Include="src\Profiles.h" />
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <ItemGroup>

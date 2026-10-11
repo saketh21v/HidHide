@@ -5,6 +5,7 @@
 #include "IDropTarget.h"
 #include "BlacklistDlg.h"
 #include "WhitelistDlg.h"
+#include "ProfilesDlg.h"
 
 class CHidHideClientDlg : public CDialogEx, public HidHide::IDropTarget
 {
@@ -89,6 +90,7 @@ private:
     CTabCtrl      m_TabApplication;
     CBlacklistDlg m_BlacklistDlg;
     CWhitelistDlg m_WhitelistDlg;
+    CProfilesDlg  m_ProfilesDlg;
 
     // Events
     afx_msg void OnPaint();

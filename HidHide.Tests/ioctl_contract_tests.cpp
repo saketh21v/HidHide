@@ -32,4 +32,19 @@ TEST(IoctlContract, IoctlCodesMatchHistoricAbi)
     EXPECT_EQ(GoldenCtlCode(2055u), static_cast<ULONG>(IOCTL_SET_WLINVERSE));
     EXPECT_EQ(GoldenCtlCode(2056u), static_cast<ULONG>(IOCTL_ADD_SESSION_BLACKLIST));
     EXPECT_EQ(GoldenCtlCode(2057u), static_cast<ULONG>(IOCTL_CLR_SESSION_BLACKLIST));
+    EXPECT_EQ(GoldenCtlCode(2058u), static_cast<ULONG>(IOCTL_GET_PROFILES));
+    EXPECT_EQ(GoldenCtlCode(2059u), static_cast<ULONG>(IOCTL_GET_PROFILE));
+    EXPECT_EQ(GoldenCtlCode(2060u), static_cast<ULONG>(IOCTL_SET_PROFILE));
+    EXPECT_EQ(GoldenCtlCode(2061u), static_cast<ULONG>(IOCTL_DEL_PROFILE));
+    EXPECT_EQ(GoldenCtlCode(2062u), static_cast<ULONG>(IOCTL_GET_ACTIVE_PROFILE));
+}
+
+// The profile I/O control codes must not collide with the historic ones
+TEST(IoctlContract, ProfileCodesAreDistinct)
+{
+    EXPECT_NE(static_cast<ULONG>(IOCTL_GET_PROFILES), static_cast<ULONG>(IOCTL_GET_WHITELIST));
+    EXPECT_NE(static_cast<ULONG>(IOCTL_GET_PROFILE), static_cast<ULONG>(IOCTL_GET_BLACKLIST));
+    EXPECT_NE(static_cast<ULONG>(IOCTL_SET_PROFILE), static_cast<ULONG>(IOCTL_SET_BLACKLIST));
+    EXPECT_NE(static_cast<ULONG>(IOCTL_DEL_PROFILE), static_cast<ULONG>(IOCTL_CLR_SESSION_BLACKLIST));
+    EXPECT_NE(static_cast<ULONG>(IOCTL_GET_ACTIVE_PROFILE), static_cast<ULONG>(IOCTL_GET_ACTIVE));
 }

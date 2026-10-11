@@ -82,6 +82,15 @@ namespace HidHide
         // Note that this doesn't imply that the file actually exists; application registration may go in advance of its actual installation
         std::wstring ValOneFullyQualifiedExecutablePath(_In_ Args const& args) const;
 
+        // Validate that there is exactly one argument holding an acceptable profile name; returns the parsing error message
+        std::wstring ValOneProfileName(_In_ Args const& args) const;
+
+        // Validate a profile name followed by an executable file on a storage volume; returns the parsing error message
+        std::wstring ValProfileNameAndFullyQualifiedExecutablePath(_In_ Args const& args) const;
+
+        // Validate a profile name followed by a device instance path; returns the parsing error message
+        std::wstring ValProfileNameAndDeviceInstancePath(_In_ Args const& args) const;
+
         // Summarizes the commands supported
         void Help(_In_ Args const& args) const;
 
@@ -138,6 +147,33 @@ namespace HidHide
 
         // Reports the current whitelist inverse
         void InvState(_In_ Args const& args) const;
+
+        // Creates a new application profile
+        void ProfileNew(_In_ Args const& args);
+
+        // Deletes an application profile
+        void ProfileDel(_In_ Args const& args);
+
+        // Lists the application profiles
+        void ProfileList(_In_ Args const& args) const;
+
+        // Shows the definition of an application profile
+        void ProfileShow(_In_ Args const& args) const;
+
+        // Binds an application to an application profile
+        void ProfileAppReg(_In_ Args const& args);
+
+        // Unbinds an application from an application profile
+        void ProfileAppUnreg(_In_ Args const& args);
+
+        // Adds a device to an application profile
+        void ProfileDevHide(_In_ Args const& args);
+
+        // Removes a device from an application profile
+        void ProfileDevUnhide(_In_ Args const& args);
+
+        // Reports the currently active application profile
+        void ProfileActive(_In_ Args const& args) const;
 
         bool const               m_ScriptMode;         // Active when standard input is redirected
         bool const               m_InteractiveMode;    // Active without command line arguments or input redirection

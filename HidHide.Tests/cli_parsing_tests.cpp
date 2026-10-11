@@ -76,3 +76,32 @@ TEST(CliParsing, ExtractCommands_syntaxError_returnsEmpty)
     auto const cmds{ ExtractCommands(s) };
     EXPECT_TRUE(cmds.empty());
 }
+
+TEST(CliParsing, ExtractCommand_profileNameAndDeviceInstancePath)
+{
+    std::wstring s{ LR"(profile-dev-hide "Game" "HID\VID_054C&PID_09CC\7&1")" };
+    auto const cmd{ ExtractCommand(s) };
+    ASSERT_EQ(3u, cmd.size());
+    EXPECT_EQ(L"profile-dev-hide", cmd[0]);
+    EXPECT_EQ(L"Game", cmd[1]);
+    EXPECT_EQ(LR"(HID\VID_054C&PID_09CC\7&1)", cmd[2]);
+}
+
+TEST(CliParsing, ExtractCommand_profileNameAndExecutablePath)
+{
+    std::wstring s{ LR"(profile-app-reg "Game" "C:\Games\x.exe")" };
+    auto const cmd{ ExtractCommand(s) };
+    ASSERT_EQ(3u, cmd.size());
+    EXPECT_EQ(L"profile-app-reg", cmd[0]);
+    EXPECT_EQ(L"Game", cmd[1]);
+    EXPECT_EQ(LR"(C:\Games\x.exe)", cmd[2]);
+}
+
+TEST(CliParsing, ExtractCommand_profileNameWithSpace)
+{
+    std::wstring s{ LR"(profile-new "My Game")" };
+    auto const cmd{ ExtractCommand(s) };
+    ASSERT_EQ(2u, cmd.size());
+    EXPECT_EQ(L"profile-new", cmd[0]);
+    EXPECT_EQ(L"My Game", cmd[1]);
+}
